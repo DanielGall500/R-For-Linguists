@@ -50,32 +50,13 @@ data[data$Parameter_name=="Consonant-Vowel Ratio" & data$Language_name=="Polish"
 data[data$Parameter_name=="Tone",]
 
 data[data$Parameter_name=="Absence of Common Consonants", c("Language_ID", "Value")]
-
-
-
-
-
 ```
 
 ## Creating Columns for interesting features
 
-We can't just combine columns because not every language has a value for every feature. This would lead to the language feature values being assigned to the wrong languages. Therefore, we will create a base table with Language_ID and Language_name. Any columns added will have to include the Language_ID, known as a "primary key". Therefore, the base table will have columns added to it based on the Language_ID.
+Our data, as is usually the case, is not structured in the optimal way for our specific use case. Therefore, we must look to cleaning and transforming the dataset in order to mold it to the shape that we require. In order to do this, we will choose some features that we are interested in from the "Parameter_name" column and convert them into their own column. For this, it may be better to have the Parameter names converted to a more suitable format for a dataset column. The following functions will do some small operations on the original string to convert "Asymmetric Case-Marking" to "asymmetric_case_marking", for instance.
 
 ```{r}
-library(dplyr)
-library(stringr)
-
-# 1. create a table with only the unique languages
-# base_table <- distinct(data[,c("Language_ID", "Language_name")])
-# base_table
-
-# 2. What features are we interested in keeping in the subset?
-parameters_to_extract <- c("Language_ID", "Value")
-base_table_cols <- c("Language_ID", "Language_name")
-primary_key <- base_table_cols[1] # first one i hope
-print(primary_key)
-VAL_COL_NAME <- "Value"
-
 get_simplified_feature_name <- function(s) {
   updated_col_name <- s %>% 
       tolower() %>% 
@@ -83,33 +64,43 @@ get_simplified_feature_name <- function(s) {
       str_replace_all("-", "_")
   return (updated_col_name)
 }
+```
 
+We can't just combine columns because not every language has a value for every feature. This would lead to the language feature values being assigned to the wrong languages. Therefore, we will create a base table with **Language_ID** and **Language_name**. Any columns added will have to include the Language_ID, known as a *primary key*. Therefore, the base table will have columns added to it based on the Language_ID.
+
+```{r}
+library(dplyr)
+library(stringr)
+
+# what are some variables that will not change throughout the analyses?
+PARAMS_FOR_SUBSET <- c("Language_ID", "Value")
+BASE_COLS <- c("Language_ID", "Language_name")
+PRIMARY_KEY <- BASE_COLS[1]
+VAL_COL <- "Value"
+PARAMETER_NAME_COL <- "Parameter_name"
 
 # iterate through each interesting feature and create a
 # new column with the values from that feature by merging
 # based on our primary key "Language_ID"
-split_features_from_dataset <- function(data, interesting_features, parameters_to_extract, base_table_cols, primary_key) {
-  base_df <- distinct(data[, base_table_cols]) # immutable, always remains a reference table
+split_features_from_dataset <- function(data, 
+                                        features,
+                                        parameters_for_subset, 
+                                        base_table_cols,
+                                        primary_key) {
+  base_df <- distinct(data[, BASE_COLS]) # immutable, always remains a reference table
   output_df <- base_table # starts off as the reference table (a copy) and grows
   
-  for (feature in interesting_features) {
-    print(feature)
-    specific_parameter_subset <- data[data$Parameter_name==feature, parameters_to_extract]
+  for (feature in features) {
+    specific_parameter_subset <- data[data[[PARAMETER_NAME_COL]] == feature, parameters_for_subset]
     
     # we want to keep all rows in the base table (we don't want to remove any languages yet, so all.x = TRUE
     # any languages which don't have a value for the feature we're interested in
     # will just have "NA"
     intermediate_df <- merge(x = base_df, y = specific_parameter_subset, by = primary_key, all.x = TRUE)
     
-    # change the merged column name from Value to our feature
+    # change the merged column name from 'Value' to our feature
     updated_col_name <- get_simplified_feature_name(feature)
-    
-    # TODO: how to abstrac the value
-    # names(final)[names(final) == VAL_COL_NAME] <- updated_col_name
-    
-    output_df[[updated_col_name]] <- intermediate_df$"Value"
-    
-    # base_table <- final
+    output_df[[updated_col_name]] <- intermediate_df[[VAL_COL]]
   }
   return (output_df)
 }
@@ -121,18 +112,18 @@ remove_na_rows <- function(df) {
 transform_data <- function(data, predictors, response) {
   predictors_col_name <- lapply(predictors, get_simplified_feature_name)
   response_col_name <- get_simplified_feature_name(response)
-  features_of_interest <- c(predictors, response)
+  features <- c(predictors, response)
   
   transformed_df <- split_features_from_dataset(data,
-                                                   features_of_interest, 
-                                                   parameters_to_extract, 
-                                                   base_table_cols,
-                                                   primary_key)
+                                                features,
+                                                PARAMS_FOR_SUBSET,
+                                                BASE_COLS,
+                                                PRIMARY_KEY)
   
   # remove any rows which don't contain a value for both features
   transformed_df <- remove_na_rows(transformed_df)
   
-  # TODO: standardise which you use of [[]] or $
+  # ensure the respones variable is interpreted as the correct type
   transformed_df[[response_col_name]] <- as.factor(transformed_df[[response_col_name]])
   
   return (transformed_df)
@@ -146,112 +137,134 @@ get_response_predictor_formula <- function(response, predictors) {
 
 ### Predicting Categorical Features
 
-In many cases in a linguistic study, you won't be trying to predict a numerical variable, but a categorical one: acceptable/unacceptable, noun/verb/adjective, native/early-nonnative/late-nonnative, etc. There's lots of possibilities.
+We will build a **Multinomial Logistic Regression model**. We require a train dataset and a test dataset, one for fitting data to the model and then a previously unseen one for testing whether that model has done a good job of generalising and has not been overfitted.
 
-It's not straightforward to use a linear regression for a problem of that kind, because fundamentally regressions are (geometrically) a business of drawing a line on a graph, which doesn't fit easily with a situation where what we are predicting is a category rather than a number.
-
-One way we can build predictive models for situations like this is by using *decision trees*.
-
-A decision tree is a partially ordered list of yes/no questions such that, by beginning at the root question and working your way down the tree, you arrive at the most likely prediction given the answers to the questions defining each node.
+First let's create a function that partitions our data.
 
 ```{r}
 set.seed(1000)
 
 split_train_test <- function(df, response, prop_train) {
-  train_indices = createDataPartition(as.factor(df[[response]]), p = prop_train, list = FALSE)
-  train_set <- df[train_index, ]
-  test_set <- df[-train_index, ]
+  train_indices <- sample(1:nrow(df), nrow(df)*0.7)
+  # train_indices = createDataPartition(df[[response]], p = prop_train, list = FALSE)
+  train_set <- df[train_indices, ]
+  test_set <- df[-train_indices, ]
   return (list(train_set, test_set))
 }
 ```
 
-## Building Model 1
+We will also need to create a *formula* which is passed to the MLR model, e.g *response \~ predictor_A + predictor_B*, which would predict the variable *response* based on the two features *predictor_A* and *predictor_B*. This formula can be created as a string with the following function:
+
+```{r}
+get_response_predictor_formula <- function(response, predictors) {
+  formula <- paste(response, paste(" ~ ", paste(predictors, collapse = " + ")))
+  return (formula)
+}
+```
+
+## Model 1: Does presence/absence of common consonants indicate whether laterals are present?
+
+Testing whether lateral consonants are common. input: "Absence of Common Consonants", output: "Lateral Consonants".
 
 ```{r}
 library(nnet)
 library(caret)
 
 # Building Model 1
-# features_of_interest_m1 <- c("Lateral Consonants", "Absence of Common Consonants")
 predictors <- c("Absence of Common Consonants")
 response <- "Lateral Consonants"
 
+predictors_col_name <- lapply(predictors, get_simplified_feature_name)
+response_col_name <- get_simplified_feature_name(response)
+
 # transform the data
-transformed_df <- transform_data(data, predictors, response)
+transformed_df_m1 <- transform_data(data, predictors, response)
 
 # create a train/test set
-train_test_data <- split_train_test(df = transformed_df, response = response_col_name, prop_train = 0.7)
-train_set_m1 <- train_test_data[[1]]
-test_set_m1 <- train_test_data[[2]]
+train_test_data_m1 <- split_train_test(df = transformed_df_m1, response = response_col_name, prop_train = 0.7)
+train_set_m1 <- train_test_data_m1[[1]]
+test_set_m1 <- train_test_data_m1[[2]]
 
 # create the formula for the response/predictor relationship e.g response ~ predictor_A + predictor_B
-multinom_feature_formula <- get_response_predictor_formula(response_col_name, predictors_col_name)
+multinom_feature_formula_m1 <- get_response_predictor_formula(response_col_name, predictors_col_name)
 
-# create a multinomial logistic regression model
-model <- multinom(multinom_feature_formula, data = train_set_m1)
+# create a multi-nomial logistic regression model
+model_m1 <- multinom(multinom_feature_formula_m1, data = train_set_m1)
 
 # run predictions with the test set
-predictions_multinom_m1 <- predict(model, newdata = test_set_m1, type="class")
+test_set_m1
+predictions_multinom_m1 <- predict(model_m1, newdata = test_set_m1, type="class")
 
 # create a confusion matrix to see the results
-cm <- confusionMatrix(predictions_multinom_m1, as.factor(test_set_m1[[response_col_name]]))
-print(cm)
+cm_m1 <- confusionMatrix(predictions_multinom_m1, as.factor(test_set_m1[[response_col_name]]))
+print(cm_m1)
 ```
 
-## Building Model 2
+## Model 2: Do stress features indicate whether a language has tone?
 
+If you have these inputs, you may not have tone. Input: Fixed Stress Locations, Weight-Sensitive Stress (check values) Output: Tone
 ```{r}
-# Building Model 2
-features_of_interest_m2 <- c("Fixed Stress Locations", "Weight-Sensitive Stress", "Tone")
-transformed_df_m2 <- split_features_from_dataset(features_of_interest_m2, parameters_to_extract, base_table_cols, primary_key)
+# Building Model 1
+predictors <- c("Fixed Stress Locations", "Weight-Sensitive Stress")
+response <- "Tone"
 
-# remove any rows which don't contain a value for both features
-transformed_df_m2 <- remove_na_rows(transformed_df_m2)
-transformed_df_m2$tone <- as.factor(transformed_df_m2$tone)
+predictors_col_name <- lapply(predictors, get_simplified_feature_name)
+response_col_name <- get_simplified_feature_name(response)
 
-# random sample of positions from the dataset
-train_index_m2 <- sample(1:nrow(transformed_df_m2), nrow(transformed_df_m2)*0.7)
+# transform the data
+transformed_df_m2 <- transform_data(data, predictors, response)
 
-# train dataset formation
-train_set_m2 <- transformed_df_m2[train_index_m2, ]
+# create a train/test set
+train_test_data_m2 <- split_train_test(df = transformed_df_m2, response = response_col_name, prop_train = 0.7)
+train_set_m2 <- train_test_data_m2[[1]]
+test_set_m2 <- train_test_data_m2[[2]]
 
-# test dataset formation
-test_set_m2 <- transformed_df_m2[-train_index_m2, ]
+# create the formula for the response/predictor relationship e.g response ~ predictor_A + predictor_B
+multinom_feature_formula_m2 <- get_response_predictor_formula(response_col_name, predictors_col_name)
 
-# Predicting lateral consonants using the absence of common consonants
-model <- multinom(tone ~ fixed_stress_locations + tone, data = train_set_m2)
-predictions_multinom_m2 <- predict(model, newdata = test_set_m2, type="class")
-predictions_multinom_m2
-cm <- confusionMatrix(predictions_multinom_m2, as.factor(test_set_m2$tone))
+# create a multi-nomial logistic regression model
+model_m2 <- multinom(multinom_feature_formula_m2, data = train_set_m2)
+
+# run predictions with the test set
+test_set_m2
+predictions_multinom_m2 <- predict(model_m2, newdata = test_set_m2, type="class")
+
+# create a confusion matrix to see the results
+cm_m2 <- confusionMatrix(predictions_multinom_m2, as.factor(test_set_m2[[response_col_name]]))
+print(cm_m2)
 ```
 
-## Building Model 3
+## Model 3: Do glottals or uvular consonants indicate whether a language has uncommon consonants?
+
+Input: Glottalised Consonants, Uvular Consonants Output: Presence of Uncommon Consonants
 
 ```{r}
-# Building Model 2
-features_of_interest_m3 <- c("Front Rounded Vowels", "Vowel Nasalization", "Vowel Quality Inventories")
-transformed_df_m3 <- split_features_from_dataset(data, features_of_interest_m3, parameters_to_extract, base_table_cols, primary_key)
-transformed_df_m3
+# Building Model 3
+predictors <- c("Glottalized Consonants", "Uvular Consonants")
+response <- "Presence of Uncommon Consonants"
 
-# remove any rows which don't contain a value for both features
-transformed_df_m3 <- remove_na_rows(transformed_df_m3)
-transformed_df_m3
-transformed_df_m3$vowel_quality_inventories <- as.factor(transformed_df_m3$vowel_quality_inventories)
+predictors_col_name <- lapply(predictors, get_simplified_feature_name)
+response_col_name <- get_simplified_feature_name(response)
 
-# random sample of positions from the dataset
-train_index_m3 <- sample(1:nrow(transformed_df_m3), nrow(transformed_df_m3)*0.7)
+# transform the data
+transformed_df_m2 <- transform_data(data, predictors, response)
 
-# train dataset formation
-train_set_m3 <- transformed_df_m3[train_index_m3, ]
+# create a train/test set
+train_test_data_m2 <- split_train_test(df = transformed_df_m2, response = response_col_name, prop_train = 0.7)
+train_set_m2 <- train_test_data_m2[[1]]
+test_set_m2 <- train_test_data_m2[[2]]
 
-# test dataset formation
-test_set_m3 <- transformed_df_m3[-train_index_m3, ]
+# create the formula for the response/predictor relationship e.g response ~ predictor_A + predictor_B
+multinom_feature_formula_m2 <- get_response_predictor_formula(response_col_name, predictors_col_name)
 
-# Predicting lateral consonants using the absence of common consonants
-train_set_m3
-model <- multinom(vowel_quality_inventories ~ front_rounded_vowels + vowel_nasalization, data = train_set_m3)
-predictions_multinom_m3 <- predict(model, newdata = test_set_m3, type="class")
-predictions_multinom_m3
-cm <- confusionMatrix(predictions_multinom_m3, as.factor(test_set_m3$vowel_quality_inventories))
-cm
+# create a multi-nomial logistic regression model
+model_m2 <- multinom(multinom_feature_formula_m2, data = train_set_m2)
+
+# run predictions with the test set
+test_set_m2
+predictions_multinom_m2 <- predict(model_m2, newdata = test_set_m2, type="class")
+
+# create a confusion matrix to see the results
+cm_m2 <- confusionMatrix(predictions_multinom_m2, as.factor(test_set_m2[[response_col_name]]))
+print(cm_m2)
 ```
